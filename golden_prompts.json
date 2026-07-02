@@ -1,0 +1,77 @@
+{
+  "_comment": "12 golden prompts. `expects` gives the harness structural checks it can automate. Answer correctness + grounding are interviewer-judged. Tool names refer to functions in tools.py.",
+  "prompts": [
+    {
+      "id": "g01_list",
+      "prompt": "List my models.",
+      "category": "basic / token-optimisation",
+      "expects": {"must_call": ["list_models"], "note": "Must slim + not dump 220 fat objects into context. Prefer newest first + a count."}
+    },
+    {
+      "id": "g02_optimise_latest_revenue",
+      "prompt": "Optimise the budget for my most recent revenue model. Moderate constraints. $500k.",
+      "category": "orchestration / ambiguity",
+      "expects": {"must_call": ["run_default_optimise", "run_constrained_optimise"], "order": [["run_default_optimise", "run_constrained_optimise"]], "note": "Must resolve 'most recent revenue model' to a real id (newest with outcomeKPI=Revenue, status Success)."}
+    },
+    {
+      "id": "g03_forecast",
+      "prompt": "What revenue would $1,000,000 deliver next quarter on model {MODEL_ID}?",
+      "category": "orchestration / dependency",
+      "expects": {"must_call": ["run_default_optimise", "run_constrained_optimise", "forecast_revenue"], "order": [["run_default_optimise", "run_constrained_optimise"], ["run_constrained_optimise", "forecast_revenue"]]}
+    },
+    {
+      "id": "g04_compare",
+      "prompt": "Compare $500k vs $750k vs $1M on my latest model and tell me which wins.",
+      "category": "multi-scenario / fan-out",
+      "expects": {"must_call": ["run_constrained_optimise", "compare_scenarios"], "note": "Three constrained runs (each saved) then one compare. No redundant agents."}
+    },
+    {
+      "id": "g05_target_kpi",
+      "prompt": "How much budget do I need to hit $2M revenue on my latest model?",
+      "category": "target-KPI / math",
+      "expects": {"must_call": ["get_mmm_input", "calculate_target_budget", "run_constrained_optimise"], "note": "Required budget is COMPUTED (target - current + all_platform_revenue), never the raw $2M."}
+    },
+    {
+      "id": "g06_current_budget_ambiguity",
+      "prompt": "What is my current budget for model {MODEL_ID}?",
+      "category": "tool ambiguity",
+      "expects": {"must_call": ["get_current_budget"], "must_not_call": ["get_planner_budget"], "note": "Two tools look interchangeable. Must pick the canonical one, not the deprecated twin."}
+    },
+    {
+      "id": "g07_adversarial_missing_model",
+      "prompt": "Optimise the budget for model 999999999 with $500k.",
+      "category": "adversarial / hallucination",
+      "expects": {"expect_fail": true, "must_not_fabricate": true, "note": "Model does not exist. Must fail loudly, not invent a model or a result."}
+    },
+    {
+      "id": "g08_adversarial_missing_budget",
+      "prompt": "Optimise my budget.",
+      "category": "adversarial / missing input",
+      "expects": {"expect_ask": true, "must_not_call": ["run_constrained_optimise"], "note": "No model, no budget. Must ask, not guess a default."}
+    },
+    {
+      "id": "g09_ambiguous_metric",
+      "prompt": "Show me conversions for my latest model.",
+      "category": "grounding / ambiguity",
+      "expects": {"expect_ask": true, "must_not_fabricate": true, "note": "There is no glossary tool. 'conversions' is ambiguous and may not be what the latest model even measures (outcomeKPI is Revenue/Conversions/Installs). The system must recognise the ambiguity itself and clarify, not invent a conversions number."}
+    },
+    {
+      "id": "g10_locked_channels",
+      "prompt": "Which channels are locked for model {MODEL_ID}?",
+      "category": "grounding",
+      "expects": {"must_call": ["channel_metadata"], "must_not_fabricate": true, "note": "'Locked' = currentBudgetData.spend == 0 per channel_metadata. Must ground, not guess a definition."}
+    },
+    {
+      "id": "g11_param_recovery",
+      "prompt": "Get the current budget for my latest model.",
+      "category": "param correctness / recovery",
+      "expects": {"must_call": ["get_current_budget"], "note": "current-budget requires camelCase mmmRequestId. If a snake_case attempt errors, the system must recover, not surface a raw 400 to the user."}
+    },
+    {
+      "id": "g12_full_chain",
+      "prompt": "Optimise my latest model with aggressive constraints at $600k, then forecast the revenue.",
+      "category": "orchestration / end-to-end",
+      "expects": {"must_call": ["run_default_optimise", "run_constrained_optimise", "forecast_revenue"], "order": [["run_default_optimise", "run_constrained_optimise"], ["run_constrained_optimise", "forecast_revenue"]], "note": "constraintType must map to Aggressive (3) via channel_metadata, not a guessed integer."}
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# The assignment scaffold (tools.py, harness.py, run.py) runs on the Python standard
+# library alone. Python 3.10+.
+#
+# Add your own agent/LLM dependencies here, e.g. one of:
+#   google-adk>=2.3.0
+#   langgraph
+#   crewai
+#   openai
+#   anthropic
+#   google-genai
+#
+# No API key? You can ship a stub LLM and still be judged on architecture + the harness.
