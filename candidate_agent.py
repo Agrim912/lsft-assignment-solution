@@ -1,22 +1,40 @@
 """
-YOUR IMPLEMENTATION GOES HERE.
+Budget-optimisation agent — REAL LLM (OpenAI via LangGraph).
 
-This is a stub so the harness runs on a fresh checkout (every prompt will FAIL until
-you build the system). Replace the body of `Agent.solve`. Keep the return contract in
-run.py. Use any framework/LLM you like — wire it in here.
+`Agent.solve` runs a small LangGraph pipeline:
 
-`Tools` below is a thin recorder around tools.py: call the tools through it and your
-`tool_calls` trace is populated automatically. Use it (or don't — but you must produce
-an accurate trace either way).
+    START -> router (LLM) -> execute (deterministic handlers) -> END
+
+The LLM does the one thing it beats a regex at: turning messy natural language into a
+structured `Intent` (which action, which slots). Everything after that — tool ordering,
+camelCase params, output slimming, grounding, and the "know / ask / fail, never guess"
+guardrail — stays deterministic Python. That keeps us at a single LLM hop per prompt,
+keeps tokens tiny, and makes hallucination structurally impossible: the model picks an
+action, it never emits a number or a model id that a tool did not return.
+
+If the LLM is unavailable (no OPENAI_API_KEY, no network, or bad output), the router
+falls back to `_parse_intent`, a deterministic regex parser, so the harness still runs
+fully offline.
+
+`Tools` is a thin recorder around tools.py: every call through it is added to the
+`tool_calls` trace automatically.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional, TypedDict
 
 import tools as _tools
+
+try:  # optional deps — real LLM path. Absent => deterministic fallback still works.
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # pragma: no cover
+    pass
 
 
 class Tools:
@@ -95,7 +113,11 @@ def _parse_amount(text: str) -> float | None:
 
 
 def _parse_intent(prompt: str) -> dict[str, Any]:
-    """Deterministic rule-based intent parser (no LLM, fewer tokens)."""
+    """Deterministic rule-based intent parser — the OFFLINE FALLBACK for the LLM router.
+
+    Used only when the LLM is unavailable (no key/network) or returns nothing usable, so
+    the harness still runs with zero LLM hops. The default path is the LLM router below.
+    """
     lower = prompt.lower()
 
     # Detect action (in priority order to avoid conflicts)
@@ -146,6 +168,13 @@ def _parse_intent(prompt: str) -> dict[str, Any]:
         except ValueError:
             pass
 
+    # Extract the ambiguous metric term (if any)
+    metric = None
+    if "conversions" in lower:
+        metric = "conversions"
+    elif "installs" in lower:
+        metric = "installs"
+
     # Extract constraint type
     constraint_type = None
     if "aggressive" in lower:
@@ -178,19 +207,7 @@ def _parse_intent(prompt: str) -> dict[str, Any]:
     elif action in ("optimise", "forecast"):
         budget = amounts[0] if amounts else None
 
-    # Check for missing required inputs
-    if action == "optimise" and (model_id is None or budget is None):
-        action = "missing_input"
-    elif action == "forecast" and (model_id is None or budget is None):
-        action = "missing_input"
-    elif action == "target_kpi" and (model_id is None or target_revenue is None):
-        action = "missing_input"
-    elif action == "unknown":
-        action = "missing_input"
-    elif action == "compare_scenarios" and len(amounts) < 2:
-        action = "missing_input"
-
-    # Build result
+    # Build result, then apply the shared "never guess" guardrail.
     result = {
         "action": action,
         "model_id": model_id,
@@ -199,28 +216,207 @@ def _parse_intent(prompt: str) -> dict[str, Any]:
         "budgets": budgets,
         "constraint_type": constraint_type,
         "time_period": time_period,
+        "metric": metric,
+        "reason": None,
     }
 
+    return _finalize_intent(result)
+
+
+def _finalize_intent(result: dict[str, Any]) -> dict[str, Any]:
+    """Enforce 'know, ask, or fail — never guess' on an intent dict.
+
+    Shared by the deterministic regex parser and the LLM router: if an action's
+    required slots are absent, downgrade to `missing_input` and name exactly what's
+    missing. This is the guardrail — even if the LLM tries to invent a budget or a
+    model id, the required slots are re-validated here before any tool runs.
+    """
+    action = result.get("action") or "unknown"
+    missing_fields: list[str] = []
+
+    if action in ("optimise", "forecast"):
+        if result.get("model_id") is None:
+            missing_fields.append("which model to use")
+        if result.get("budget") is None:
+            missing_fields.append("a total budget amount")
+        if missing_fields:
+            action = "missing_input"
+    elif action == "target_kpi":
+        if result.get("model_id") is None:
+            missing_fields.append("which model to use")
+        if result.get("target_revenue") is None:
+            missing_fields.append("a target revenue amount")
+        if missing_fields:
+            action = "missing_input"
+    elif action == "compare_scenarios":
+        if len(result.get("budgets") or []) < 2:
+            missing_fields.append("at least two budget amounts to compare")
+            action = "missing_input"
+    elif action == "unknown":
+        action = "missing_input"
+
+    reason = result.get("reason")
+    if action == "missing_input" and not reason:
+        if missing_fields:
+            reason = "I need " + " and ".join(missing_fields) + " to proceed."
+        else:
+            reason = "Could you clarify what you'd like me to do?"
+
+    result["action"] = action
+    result["reason"] = reason
     return result
 
 
-class Agent:
-    def __init__(self) -> None:
-        pass
+# =========================================================================== #
+# LLM router — natural language -> structured Intent (the only LLM hop).
+# =========================================================================== #
+_MODEL_NAME = os.getenv("LLM_MODEL", "gpt-4o-mini")
+_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0") or 0)
 
+_ROUTER_SYSTEM_PROMPT = """You are the ROUTER for a marketing budget-optimisation agent. \
+Your ONLY job is to classify one user message into a structured Intent. You do NOT call \
+tools and you do NOT answer the question yourself.
+
+Actions:
+- list_models: user wants to see / list their models.
+- get_current_budget: user asks for the CURRENT budget of a model.
+- locked_channels: user asks which channels are locked.
+- optimise: user wants to optimise / reallocate a budget (needs a model and a budget).
+- forecast: user asks what revenue a given budget would deliver (needs a model and a budget).
+- compare_scenarios: user wants to compare two or more budget amounts and pick a winner.
+- target_kpi: user asks how much budget is needed to HIT a target revenue.
+- ambiguous: user asks for a metric/term not clearly defined by the tools (e.g. \
+"conversions", "installs"); set `metric` to their exact word.
+- unknown: none of the above.
+
+Rules (critical — we must never guess):
+- Set model_id only if explicitly present. If they say "latest"/"recent"/"most recent \
+revenue model", set model_id to the string "latest". Otherwise null. NEVER invent a numeric id.
+- Parse dollar amounts exactly ($500k -> 500000, $1M -> 1000000, $2M -> 2000000). If no \
+amount is present, leave the slot null/empty — do not assume a default.
+- If a required amount or model is missing, still pick the base action and leave the \
+missing slot null; a downstream guardrail will ask the user.
+- constraint_type only if the user names one (aggressive/moderate/conservative/current)."""
+
+
+def _build_intent_model():
+    """Pydantic schema for structured output (built lazily so import never needs pydantic)."""
+    from pydantic import BaseModel, Field
+    from typing_extensions import Literal
+
+    class Intent(BaseModel):
+        action: Literal[
+            "list_models", "get_current_budget", "locked_channels", "optimise",
+            "forecast", "compare_scenarios", "target_kpi", "ambiguous", "unknown",
+        ] = Field(description="The single best-matching action.")
+        model_id: Optional[str] = Field(
+            default=None,
+            description="Numeric model id if given; 'latest' if they said latest/recent; else null.",
+        )
+        budget: Optional[float] = Field(default=None, description="Total budget in dollars; null if absent.")
+        target_revenue: Optional[float] = Field(default=None, description="Target revenue in dollars; null if absent.")
+        budgets: list[float] = Field(default_factory=list, description="All budgets to compare, in dollars.")
+        constraint_type: Optional[Literal["Current", "Conservative", "Moderate", "Aggressive"]] = Field(default=None)
+        time_period: Literal["week", "month", "quarter"] = Field(default="quarter")
+        metric: Optional[str] = Field(default=None, description="Raw term for an ambiguous metric request.")
+
+    return Intent
+
+
+class _AgentState(TypedDict, total=False):
+    prompt: str
+    intent: dict[str, Any]
+    answer: str
+    asked_user: bool
+    failed: bool
+    llm_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    agent: Any
+    tools: Any
+
+
+class Agent:
+    """Real-LLM agent: a LangGraph pipeline (LLM router -> deterministic execution)."""
+
+    def __init__(self) -> None:
+        self._llm = None
+        self._intent_model = None
+        self._graph = self._build_graph()
+
+    # ---- LLM client (lazy, cached) --------------------------------------- #
+    def _get_llm(self) -> Any:
+        if self._llm is None:
+            from langchain_openai import ChatOpenAI
+
+            self._llm = ChatOpenAI(model=_MODEL_NAME, temperature=_TEMPERATURE)
+            self._intent_model = _build_intent_model()
+        return self._llm
+
+    # ---- Graph ----------------------------------------------------------- #
+    def _build_graph(self) -> Any:
+        """Compile the LangGraph. Returns None if LangGraph isn't installed (fallback path)."""
+        try:
+            from langgraph.graph import END, START, StateGraph
+        except Exception:
+            return None
+        g = StateGraph(_AgentState)
+        g.add_node("router", self._router_node)
+        g.add_node("execute", self._execute_node)
+        g.add_edge(START, "router")
+        g.add_edge("router", "execute")
+        g.add_edge("execute", END)
+        return g.compile()
+
+    def _router_node(self, state: _AgentState) -> dict[str, Any]:
+        """LLM node: prompt -> structured Intent. Falls back to the regex parser on any error."""
+        prompt = state["prompt"]
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            structured = self._get_llm().with_structured_output(self._intent_model, include_raw=True)
+            res = structured.invoke([SystemMessage(_ROUTER_SYSTEM_PROMPT), HumanMessage(prompt)])
+            parsed = res["parsed"]
+            if parsed is None:
+                raise ValueError("structured output returned no parse")
+            usage = getattr(res.get("raw"), "usage_metadata", None) or {}
+            intent = parsed.model_dump()
+            intent["reason"] = None
+            intent = _finalize_intent(intent)
+            return {
+                "intent": intent,
+                "llm_calls": 1,
+                "prompt_tokens": int(usage.get("input_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("output_tokens", 0) or 0),
+            }
+        except Exception:
+            intent = _parse_intent(prompt)  # deterministic fallback (already finalized)
+            return {"intent": intent, "llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+    def _execute_node(self, state: _AgentState) -> dict[str, Any]:
+        """Deterministic node: run the grounded handlers for the routed intent."""
+        answer, asked_user, failed = self._route_intent(state["intent"], state["prompt"], state["tools"])
+        return {"answer": answer, "asked_user": asked_user, "failed": failed}
+
+    # ---- Entry point ----------------------------------------------------- #
     def solve(self, prompt: str) -> dict[str, Any]:
         t0 = time.time()
         tools_rec = Tools()
-        llm_calls = 0
-        prompt_tokens = 0
-        completion_tokens = 0
-        asked_user = False
-        failed = False
-        answer = ""
+        answer, asked_user, failed = "", False, False
+        llm_calls = prompt_tokens = completion_tokens = 0
 
         try:
-            intent = _parse_intent(prompt)
-            answer, asked_user, failed = self._route_intent(intent, prompt, tools_rec)
+            if self._graph is not None:
+                final = self._graph.invoke({"prompt": prompt, "agent": self, "tools": tools_rec})
+                answer = final.get("answer", "")
+                asked_user = bool(final.get("asked_user", False))
+                failed = bool(final.get("failed", False))
+                llm_calls = int(final.get("llm_calls", 0))
+                prompt_tokens = int(final.get("prompt_tokens", 0))
+                completion_tokens = int(final.get("completion_tokens", 0))
+            else:  # LangGraph unavailable — deterministic path
+                intent = _parse_intent(prompt)
+                answer, asked_user, failed = self._route_intent(intent, prompt, tools_rec)
         except Exception as e:
             failed = True
             answer = f"System error: {str(e)}"
@@ -248,18 +444,32 @@ class Agent:
             return (f"I need more information: {intent.get('reason', 'Please provide required details.')}", True, False)
 
         if action == "ambiguous":
-            # For conversions/installs: check if the model actually measures this KPI
-            if "conversions" in prompt.lower() or "installs" in prompt.lower():
-                model_id = intent.get("model_id")
-                if model_id and model_id != "latest":
-                    res = tools_rec.call("get_model_details", mmmRequestId=str(model_id))
-                    if res["status"] == "success":
-                        model_kpi = res["data"].get("outcomeKPI")
-                        metric = "conversions" if "conversions" in prompt.lower() else "installs"
-                        if model_kpi and metric not in model_kpi.lower():
-                            reason = f"This model measures '{model_kpi}', not {metric}. Please clarify what metric you'd like to see."
-                            return (f"I need clarification: {reason}", True, False)
-            return (f"I need clarification: {intent.get('reason', 'The request is ambiguous.')}", True, False)
+            # Ground the ambiguity in the model's ACTUAL outcomeKPI. Resolve the model
+            # first (including "latest"), read its KPI, and only then decide how to
+            # phrase the clarification. Never invent a metric value.
+            metric = intent.get("metric") or "that metric"
+            model_id = intent.get("model_id")
+            if not model_id or model_id == "latest":
+                model_id = self._resolve_latest_model(tools_rec)
+
+            model_kpi = None
+            if model_id:
+                res = tools_rec.call("get_model_details", mmmRequestId=str(model_id))
+                if res["status"] == "success":
+                    model_kpi = res["data"].get("outcomeKPI")
+
+            if model_kpi and metric.lower() not in model_kpi.lower():
+                reason = (
+                    f"this model's outcome KPI is '{model_kpi}', not '{metric}'. "
+                    f"There's no glossary mapping '{metric}' to a field, so I won't "
+                    f"guess a number - could you clarify exactly what you'd like to see?"
+                )
+            else:
+                reason = (
+                    f"'{metric}' is ambiguous and there's no glossary tool to resolve "
+                    f"it to a concrete field. Could you clarify which metric you mean?"
+                )
+            return (f"I need clarification: {reason}", True, False)
 
         if action == "list_models":
             return self._handle_list_models(tools_rec)

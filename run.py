@@ -31,12 +31,21 @@ from __future__ import annotations
 from typing import Any
 
 
-def solve(prompt: str) -> dict[str, Any]:
-    # TODO: replace this stub with your system.
-    # Example of the required return shape:
-    from candidate_agent import Agent  # your implementation
+_AGENT: Any = None
 
-    return Agent().solve(prompt)
+
+def _get_agent() -> Any:
+    """Cache one agent across prompts (builds the LangGraph + LLM client once)."""
+    global _AGENT
+    if _AGENT is None:
+        from candidate_agent import Agent  # real-LLM LangGraph agent (regex fallback inside)
+
+        _AGENT = Agent()
+    return _AGENT
+
+
+def solve(prompt: str) -> dict[str, Any]:
+    return _get_agent().solve(prompt)
 
 
 if __name__ == "__main__":

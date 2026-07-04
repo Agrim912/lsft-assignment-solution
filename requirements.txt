@@ -10,3 +10,15 @@
 #   google-genai
 #
 # No API key? You can ship a stub LLM and still be judged on architecture + the harness.
+#
+# ---------------------------------------------------------------------------
+# Real-LLM agent (LangGraph router + deterministic execution). See candidate_agent.py.
+# Install into the project venv only:  .venv/Scripts/python -m pip install -r requirements.txt
+# Needs OPENAI_API_KEY + LLM_MODEL in .env. Without them the agent falls back to the
+# deterministic parser, so the harness still runs.
+# ---------------------------------------------------------------------------
+langgraph==1.2.7
+langchain-openai==1.3.3
+langchain-core==1.4.8
+pydantic==2.13.4
+python-dotenv==1.2.2
