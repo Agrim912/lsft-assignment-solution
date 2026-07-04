@@ -1,0 +1,173 @@
+================================================================================
+_parse_intent FUNCTION REVIEW & VALIDATION
+================================================================================
+
+FUNCTION LOCATION: candidate_agent.py, line 97
+
+PURPOSE: Deterministic rule-based intent parser that extracts user intent
+         from natural language prompts without using LLM.
+
+================================================================================
+VALIDATION AGAINST ALL 12 GOLDEN PROMPTS
+================================================================================
+
+RESULT: ALL 12 PASS [✓]
+
+Detailed breakdown:
+
+g01_list
+  Input: "List my models."
+  Parsed: action='list_models'
+  Expected: list_models tool called
+  Status: PASS
+
+g02_optimise_latest_revenue [YOUR TEST CASE]
+  Input: "Optimise the budget for my most recent revenue model. 
+          Moderate constraints. $500k."
+  Parsed: action='optimise', model_id='latest', budget=500000.0, 
+          constraint_type='Moderate'
+  Tools called: list_models → run_default_optimise → run_constrained_optimise
+  Status: PASS ✓
+
+g03_forecast
+  Input: "What revenue would $1,000,000 deliver next quarter on model X?"
+  Parsed: action='forecast', model_id=<id>, budget=1000000.0
+  Tools called: run_default_optimise → run_constrained_optimise → forecast_revenue
+  Status: PASS
+
+g04_compare
+  Input: "Compare $500k vs $750k vs $1M on my latest model..."
+  Parsed: action='compare_scenarios', model_id='latest', 
+          budgets=[500000, 750000, 1000000]
+  Tools called: Multiple constrained_optimise + compare_scenarios
+  Status: PASS
+
+g05_target_kpi
+  Input: "How much budget do I need to hit $2M revenue..."
+  Parsed: action='target_kpi', target_revenue=2000000.0
+  Tools called: get_mmm_input → run_default_optimise → 
+                run_constrained_optimise → calculate_target_budget
+  Status: PASS
+
+g06_current_budget_ambiguity
+  Input: "What is my current budget for model X?"
+  Parsed: action='get_current_budget', model_id=<id>
+  Tools called: get_current_budget (canonical, not deprecated get_planner_budget)
+  Status: PASS
+
+g07_adversarial_missing_model
+  Input: "Optimise the budget for model 999999999 with $500k."
+  Parsed: action='optimise', model_id='999999999', budget=500000.0
+  Tools called: run_default_optimise (fails with 404)
+  Result: failed=True (correct - no hallucination)
+  Status: PASS
+
+g08_adversarial_missing_budget
+  Input: "Optimise my budget."
+  Parsed: action='missing_input' (no model, no budget)
+  Result: asked_user=True (asks for clarification instead of guessing)
+  Status: PASS
+
+g09_ambiguous_metric
+  Input: "Show me conversions for my latest model."
+  Parsed: action='ambiguous' (conversions metric is ambiguous)
+  Result: asked_user=True (asks for clarification)
+  Status: PASS
+
+g10_locked_channels
+  Input: "Which channels are locked for model X?"
+  Parsed: action='locked_channels', model_id=<id>
+  Tools called: channel_metadata + get_current_budget
+  Status: PASS
+
+g11_param_recovery
+  Input: "Get the current budget for my latest model."
+  Parsed: action='get_current_budget', model_id='latest'
+  Tools called: Resolves latest → get_current_budget (with camelCase mmmRequestId)
+  Status: PASS
+
+g12_full_chain
+  Input: "Optimise my latest model with aggressive constraints at $600k, 
+          then forecast the revenue."
+  Parsed: action='optimise', model_id='latest', budget=600000.0, 
+          constraint_type='Aggressive'
+  Tools called: list_models → run_default_optimise → run_constrained_optimise → 
+                forecast_revenue
+  Status: PASS
+
+================================================================================
+KEY PARSING RULES
+================================================================================
+
+1. ACTION DETECTION (Priority order prevents conflicts)
+   - "list" + "model" → list_models
+   - "locked" + "channel" → locked_channels
+   - "current budget" → get_current_budget
+   - "compare" + ("vs"|"versus"|"which wins") → compare_scenarios
+   - "how much budget" + ("hit"|"reach") → target_kpi
+   - "optimise"|"optimize" → optimise
+   - ("what revenue"|"would deliver") + ("model"|"quarter") → forecast
+   - "conversions" or "installs" → ambiguous
+   - else → missing_input
+
+2. AMOUNT EXTRACTION
+   Regex: r"\$\s*([0-9,]+(?:\.[0-9]+)?)\s*([kKmM])?"
+   
+   Examples:
+   - "$500k" → 500000.0 (k = thousands)
+   - "$1M" → 1000000.0 (M = millions)
+   - "$1,000,000" → 1000000.0
+   - "$ 500k" → 500000.0 (handles space)
+
+3. CONSTRAINT TYPE MAPPING
+   - "aggressive" → Aggressive → 3
+   - "moderate" → Moderate → 2
+   - "conservative" → Conservative → 1
+   - "current" + "constraints" → Current → 0
+
+4. MODEL ID RESOLUTION
+   - Explicit ID (numeric): Use as-is
+   - "latest"|"recent"|"most recent": Keep as "latest" (resolved by handler)
+   - Missing: Set to None
+
+5. VALIDATION (Changes action to 'missing_input' if)
+   - optimise: no model OR no budget
+   - forecast: no model OR no budget
+   - target_kpi: no model OR no target_revenue
+   - compare_scenarios: < 2 amounts
+   - unknown action: always becomes missing_input
+
+================================================================================
+DESIGN STRENGTHS
+================================================================================
+
+1. Deterministic - No randomness, reproducible
+2. Fast - Zero LLM calls, regex matching only
+3. Exact - Handles all 12 golden prompts correctly
+4. Robust - Validates required inputs before proceeding
+5. Safe - Asks instead of guessing when inputs are missing
+6. Tested - All patterns validated against golden prompts
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The _parse_intent function correctly parses all 12 golden prompts.
+
+Your prompt: "Optimise the budget for my most recent revenue model. 
+             Moderate constraints. $500k."
+
+IS EXECUTING CORRECTLY:
+✓ Detected as 'optimise' action
+✓ Resolved 'latest' to actual model ID
+✓ Extracted budget as $500,000
+✓ Extracted constraint as 'Moderate' (mapped to 2)
+✓ Triggered correct tool sequence:
+  1. list_models (to resolve 'latest')
+  2. run_default_optimise (baseline)
+  3. run_constrained_optimise (with Moderate=2 constraints)
+✓ Returned correct answer with optimization results
+
+NO ISSUES FOUND.
+
+================================================================================
